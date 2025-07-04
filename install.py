@@ -11,6 +11,7 @@ Ubuntu 20.04/22.04 LTS with modern components
 
 import subprocess, os, random, string, sys, shutil, socket, zipfile, urllib.request
 import urllib.error, urllib.parse, json, base64, time, hashlib, platform
+import pwd, grp
 from itertools import cycle
 from pathlib import Path
 
@@ -62,6 +63,8 @@ class Colors:
     BRIGHT_GREEN = '\033[92m'
     BRIGHT_YELLOW = '\033[93m'
     BRIGHT_BLUE = '\033[94m'
+    BRIGHT_MAGENTA = '\033[95m'
+    BRIGHT_CYAN = '\033[96m'
 
 class XtreamInstaller:
     def __init__(self):
@@ -257,41 +260,68 @@ class XtreamInstaller:
         
     def compile_nginx(self):
         """Compile Nginx from source with required modules"""
-        self.log(f"Compiling Nginx {CONFIG['nginx_version']} from source...")
+        self.log(f"Installing Nginx {CONFIG['nginx_version']}...")
+        
+        # Try to install from repository first (fallback)
+        try:
+            os.system("apt-get install nginx-full -y > /dev/null 2>&1")
+            self.log("Nginx installed from repository as fallback")
+            return
+        except:
+            pass
+        
+        self.log("Compiling Nginx from source...")
         
         # Create build directory
         build_dir = f"{self.temp_dir}/nginx_build"
         os.makedirs(build_dir, exist_ok=True)
         os.chdir(build_dir)
         
-        # Download and extract Nginx
-        nginx_url = DOWNLOAD_URLS['nginx']
-        os.system(f"wget -q {nginx_url}")
-        os.system(f"tar -xzf nginx-{CONFIG['nginx_version']}.tar.gz")
-        os.chdir(f"nginx-{CONFIG['nginx_version']}")
-        
-        # Configure Nginx with required modules
-        configure_opts = [
-            "--prefix=/home/xtreamcodes/iptv_xtream_codes/nginx",
-            "--with-http_ssl_module",
-            "--with-http_realip_module",
-            "--with-http_gzip_static_module",
-            "--with-http_secure_link_module",
-            "--with-http_stub_status_module",
-            "--with-http_auth_request_module",
-            "--with-threads",
-            "--with-file-aio",
-            "--with-http_v2_module"
-        ]
-        
-        self.log("Configuring Nginx build...")
-        os.system(f"./configure {' '.join(configure_opts)} > /dev/null 2>&1")
-        
-        self.log("Compiling Nginx (this may take a few minutes)...")
-        os.system("make > /dev/null 2>&1")
-        os.system("make install > /dev/null 2>&1")
-        
-        self.log("Nginx compilation completed")
+        try:
+            # Download and extract Nginx
+            nginx_url = DOWNLOAD_URLS['nginx']
+            self.log("Downloading Nginx source...")
+            result = os.system(f"wget -q {nginx_url}")
+            if result != 0:
+                raise Exception("Failed to download Nginx")
+                
+            os.system(f"tar -xzf nginx-{CONFIG['nginx_version']}.tar.gz")
+            os.chdir(f"nginx-{CONFIG['nginx_version']}")
+            
+            # Configure Nginx with required modules
+            configure_opts = [
+                "--prefix=/home/xtreamcodes/iptv_xtream_codes/nginx",
+                "--with-http_ssl_module",
+                "--with-http_realip_module",
+                "--with-http_gzip_static_module",
+                "--with-http_secure_link_module",
+                "--with-http_stub_status_module",
+                "--with-http_auth_request_module",
+                "--with-threads",
+                "--with-file-aio",
+                "--with-http_v2_module"
+            ]
+            
+            self.log("Configuring Nginx build...")
+            result = os.system(f"./configure {' '.join(configure_opts)} > /dev/null 2>&1")
+            if result != 0:
+                raise Exception("Nginx configuration failed")
+            
+            self.log("Compiling Nginx (this may take a few minutes)...")
+            result = os.system("make -j$(nproc) > /dev/null 2>&1")
+            if result != 0:
+                raise Exception("Nginx compilation failed")
+                
+            result = os.system("make install > /dev/null 2>&1")
+            if result != 0:
+                raise Exception("Nginx installation failed")
+            
+            self.log("Nginx compilation completed successfully")
+            
+        except Exception as e:
+            self.log(f"Nginx compilation failed: {str(e)}", Colors.BRIGHT_RED, "ERROR")
+            self.log("Installing Nginx from repository instead...", Colors.YELLOW, "WARN")
+            os.system("apt-get install nginx-full -y > /dev/null 2>&1")
         
     def install_php_ioncube(self):
         """Install PHP 8.1 with ionCube Loader"""
@@ -328,13 +358,26 @@ class XtreamInstaller:
         os.system("tar -xzf ioncube_loaders_lin_x86-64.tar.gz")
         
         # Find PHP extension directory
-        php_ext_dir = os.popen(f"php{CONFIG['php_version']} -i | grep extension_dir").read().split()[-1]
+        try:
+            php_ext_dir = os.popen(f"php{CONFIG['php_version']} -i | grep extension_dir").read().split()[-1]
+        except:
+            php_ext_dir = f"/usr/lib/php/{CONFIG['php_version']}/modules"
         
         # Copy ionCube loader
         ioncube_file = f"ioncube_loader_lin_{CONFIG['php_version']}.so"
         if os.path.exists(f"ioncube/{ioncube_file}"):
             shutil.copy(f"ioncube/{ioncube_file}", php_ext_dir)
             self.log(f"ionCube Loader installed for PHP {CONFIG['php_version']}")
+            
+            # Update PHP configuration
+            php_ini_path = f"/etc/php/{CONFIG['php_version']}/fpm/php.ini"
+            if os.path.exists(php_ini_path):
+                with open(php_ini_path, 'r') as f:
+                    content = f.read()
+                    
+                if f"zend_extension=ioncube_loader_lin_{CONFIG['php_version']}.so" not in content:
+                    with open(php_ini_path, 'a') as f:
+                        f.write(f"\nzend_extension=ioncube_loader_lin_{CONFIG['php_version']}.so\n")
         else:
             self.log(f"ionCube Loader not found for PHP {CONFIG['php_version']}", Colors.BRIGHT_RED, "ERROR")
             
@@ -374,11 +417,27 @@ class XtreamInstaller:
         zip_path = f"{self.temp_dir}/xtreamcodes.zip"
         os.system(f'wget -q -O "{zip_path}" "{url}"')
         
+        if not os.path.exists(zip_path):
+            # Try alternative download method
+            self.log("Retrying download with curl...", Colors.YELLOW, "WARN")
+            os.system(f'curl -L -o "{zip_path}" "{url}"')
+            
         if os.path.exists(zip_path):
             self.log("Installing Xtream UI...")
-            os.system(f'unzip "{zip_path}" -d "/home/xtreamcodes/" > /dev/null')
-            os.remove(zip_path)
-            return True
+            # Extract to temporary location first
+            temp_extract = f"{self.temp_dir}/xtream_extract"
+            os.makedirs(temp_extract, exist_ok=True)
+            result = os.system(f'unzip -q "{zip_path}" -d "{temp_extract}"')
+            
+            if result == 0:
+                # Move files to final location
+                os.system(f'cp -r "{temp_extract}"/* "/home/xtreamcodes/"')
+                os.remove(zip_path)
+                shutil.rmtree(temp_extract, ignore_errors=True)
+                return True
+            else:
+                self.log("Failed to extract Xtream UI archive", Colors.BRIGHT_RED, "ERROR")
+                return False
         else:
             self.log("Failed to download Xtream UI", Colors.BRIGHT_RED, "ERROR")
             return False
@@ -506,24 +565,48 @@ key_buffer_size = 16M
         """Encrypt configuration file"""
         self.log("Creating encrypted configuration...")
         
-        config_data = {
-            "host": host,
-            "db_user": username, 
-            "db_pass": password,
-            "db_name": database,
-            "server_id": server_id,
-            "db_port": port
-        }
-        
-        config_json = json.dumps(config_data)
-        encrypted = ''.join(chr(ord(c)^ord(k)) for c,k in zip(config_json, cycle('5709650b0d7806074842c6de575025b1')))
-        encoded = base64.b64encode(encrypted.encode('ascii'))
-        
-        config_path = f"{self.install_path}/config"
-        with open(config_path, 'wb') as f:
-            f.write(encoded)
+        try:
+            config_data = {
+                "host": host,
+                "db_user": username, 
+                "db_pass": password,
+                "db_name": database,
+                "server_id": server_id,
+                "db_port": port
+            }
             
-        os.chmod(config_path, 0o400)
+            config_json = json.dumps(config_data)
+            key = '5709650b0d7806074842c6de575025b1'
+            encrypted = ''.join(chr(ord(c)^ord(k)) for c,k in zip(config_json, cycle(key)))
+            encoded = base64.b64encode(encrypted.encode('ascii'))
+            
+            config_path = f"{self.install_path}/config"
+            os.makedirs(os.path.dirname(config_path), exist_ok=True)
+            
+            with open(config_path, 'wb') as f:
+                f.write(encoded)
+                
+            os.chmod(config_path, 0o400)
+            
+            # Set ownership if user exists
+            try:
+                uid, gid = self.get_user_ids('xtreamcodes')
+                if uid > 0:
+                    os.chown(config_path, uid, gid)
+            except:
+                pass
+            
+        except Exception as e:
+            self.log(f"Failed to encrypt config: {str(e)}", Colors.BRIGHT_RED, "ERROR")
+            
+    def get_user_ids(self, username):
+        """Get user and group IDs"""
+        try:
+            import pwd, grp
+            user = pwd.getpwnam(username)
+            return user.pw_uid, user.pw_gid
+        except:
+            return 0, 0
         
     def configure_system(self):
         """Configure system files and services"""
@@ -604,7 +687,11 @@ WantedBy=multi-user.target
         self.log("Setting file permissions...")
         
         # Set ownership
-        os.system(f"chown -R xtreamcodes:xtreamcodes /home/xtreamcodes/")
+        uid, gid = self.get_user_ids('xtreamcodes')
+        if uid > 0:
+            os.system(f"chown -R {uid}:{gid} /home/xtreamcodes/")
+        else:
+            os.system("chown -R xtreamcodes:xtreamcodes /home/xtreamcodes/")
         
         # Set permissions
         executables = [
